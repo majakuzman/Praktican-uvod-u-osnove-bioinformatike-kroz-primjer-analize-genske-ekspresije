@@ -1,0 +1,568 @@
+---
+title: "DESeq analiza"
+author: "Kuzman Consulting"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Cilj analize
+
+Želimo testirati koji su geni diferencijalno eksprimirani između uzoraka zdravih i tumorskih stanica.
+
+## Instalacija i učitavanje paketa
+
+Ako u konzoli vidite "*update all/some/none*", pritisnite "n" i "Enter".
+
+```{r, message=FALSE, warning=FALSE}
+## CRAN paketi
+libraries_cran <- c("tidyverse", "openxlsx", "ggplot2", "ggrepel", "ggpubr", "eulerr", "pheatmap", "rlang")
+
+libraries_cran_to_install <- libraries_cran[!(libraries_cran %in% installed.packages()[, "Package"])]
+if(length(libraries_cran_to_install)) install.packages(libraries_cran_to_install)
+
+## Bioconductor paketi
+libraries_bioconductor <- c("GEOquery", "DESeq2", "EnhancedVolcano", "biomaRt", "clusterProfiler", "org.Hs.eg.db", "ReactomePA")
+
+if(!require("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+libraries_bioconductor_to_install <- libraries_bioconductor[!(libraries_bioconductor %in% installed.packages()[, "Package"])]
+if(length(libraries_bioconductor_to_install)) BiocManager::install(libraries_bioconductor)
+```
+
+```{r, warning=FALSE, message=FALSE}
+## učitavanje i uređivanje podataka
+library(tidyverse)
+library(openxlsx)
+
+## diferencijalna ekspresija
+library(GEOquery)
+library(DESeq2)
+
+## vizualizacija
+library(ggplot2)
+library(ggpubr)
+library(ggrepel)
+library(EnhancedVolcano)
+library(pheatmap)
+
+## analiza obogaćivanja gena 
+library(biomaRt)
+library(clusterProfiler)
+
+## anotacija ljudskog genoma
+library(org.Hs.eg.db)
+```
+
+## Priprema podataka
+
+R može učitati datoteke različitih formata, ali za mnoge javno dostupne biološke eksperimente postoji način da se učitaju direktno iz baza podataka.
+
+R/Bioconductor paket zvan `GEOquery` služi za preuzimanje i učitavanje podataka iz GEO baze (Gene Expression Omnibus) direktno iiz R-a te ih učitava kao `ExpressionSet` ili `SummarizedExperiment` objekte.
+
+Podaci koji se koriste u ovoj analizi su javno dostupni u Gene Expression Omnibusu: [GSE81089](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE81089)
+
+Preuzimanje podataka (tablica s brojem readova, metapodaci, informacije o eksperimentu).
+
+```{r}
+# GEO accession number eksperimenta
+my_geo <- "GSE81089"
+Sys.setenv(VROOM_CONNECTION_SIZE = 500000)
+geo_data <- getGEO(my_geo)[[1]]
+
+# analiza fenotipske tablice/metapodataka
+head(geo_data@phenoData@data)
+```
+
+### Uređivanje podataka
+
+**`Tidyverse`** je skup međusobno povezanih R paketa osmišljenih za jednostavno, čitljivo i konzistetno rukovanje podacima. Glavna ideja tidyverse pristupa je da se svi koraci analize (čišćenja podataka, transformacije, vizualizacije,...) mogu izvesti kroz jedinstvenu logiku i sintaksu.
+
+Neki od ključnih tidyverse paketa su:
+
+-   **dplyr** – manipulacija i filtriranje podataka
+
+-   **tidyr** – preoblikovanje podataka (pivotiranje, razdvajanje, spajanje)
+
+-   **ggplot2** – vizualizacija podataka
+
+-   **readr** – učitavanje podataka
+
+-   **stringr**, **forcats** i **lubridate** – rad s tekstom, kategorijama i datumima
+
+Također sadrži i takozvani *pipe* operator (`%>%`) koji omogućuje jednostavno spajanje više naredbi u jasan niz koraka (rezultat jedne funkcije automatski postaje ulazni argument sljedeće), te omogućuje jednostavno čitanje kod s lijeva na desno. Kratica za `%>%` je ctrl+alt+M
+
+Za početak ćemo odabrati varijable od interesa i urediti njihove nazive.
+
+```{r}
+## popis varijabli koje želimo zadržati
+keep_cols <- c(
+  "title",
+  "geo_accession",
+  "age:ch1",                      ## dob pacijenta
+  "dead:ch1",                     ## status (0 - živ, 1 - preminuo)
+  "gender:ch1",                   ## spol
+  "histology:ch1",                ## histološka klasifikacija tumora (podtip raka)
+  "ps who:ch1",                   ## WHO procjena općeg funkcionalnog stanja 
+  "smoking:ch1",                  ## pušački status
+  "stage tnm:ch1",                ## stadij tumora
+  "tumor (t) or normal (n):ch1"
+)
+
+## iz naših metapodataka, odaberi samo zadane varijable
+
+# Select certain columns
+metadata <- geo_data@phenoData@data %>% 
+  dplyr::select(all_of(keep_cols)) 
+
+names(metadata)
+```
+
+Uređivanje naziva varijabli/stupaca:
+
+```{r}
+names(metadata) <- names(metadata) %>%
+  stringr::str_remove(":ch1") %>% 
+  stringr::str_replace(" ", "_")
+
+metadata <- dplyr::rename(metadata, "sample" = "tumor_(t) or normal (n)")
+
+names(metadata)
+```
+
+Nakon što smo ispravili nazive varijabli, provjerit ćemo njihove tipove. Postoji nekoliko korisnih funkcija koje možemo iskoristiti za to.
+
+```{r}
+## sažeti popis svih varijabli, njihov tip i prvih nekoliko vrijednosti
+str(metadata) 
+```
+
+Pojedine varijable bi trebale biti faktori - tip varijabli koji se koristi za kategorije (npr. spol, stadij tumora i sl.). Za pojedine analize je bitno definirati varijable kao faktore kako bi one pravilo funkcionirale, pa tako i analiza diferencijalne ekspresije gena budući da se radi izmedu određenih grupa.
+
+Funkcija `lapply()` u R-u služi za primjenu iste funkcije na svaki element liste ili vektora te uvijek vraća listu kao rezultat.
+
+```{r}
+## faktor varijable
+factor_cols <- c("dead", "gender", "histology", "ps_who", "smoking", "stage_tnm")
+metadata[, factor_cols] <- lapply(metadata[, factor_cols], as.factor)
+
+## numerička varijabla
+metadata$age <- as.numeric(metadata$age)
+```
+
+Varijabla koju smo preimenovali u *sample* sadrži informaciju je li uzorak iz turmoskog ili zdravog tkiva (ovisno o tome završava li s T ili N). Želimo zadržati i nazive pojedinih uzoraka, ali također i stvoriti novu varijablu koja označava porijeklo uzorka.
+
+```{r}
+head(metadata$sample)
+
+metadata$patient <- as.factor(stringr::str_remove(metadata$sample, "T|N"))
+metadata$condition <- as.factor(stringr::str_replace(metadata$sample, 
+                                           ".*L[0-9]+([A-Za-z]).*", "\\1"))
+
+head(metadata$patient)
+head(metadata$condition)
+```
+
+Možemo primijetiti da neke vrijednosti nedostaju i, ako malo bolje proučimo podatke, shvatit ćemo da za zdrave uzorke nema unesenih podataka. Ponekad ne možemo riješiti taj problem, osim eventualno isključiti te uzorke iz daljnje analize ako su nam te varijable bitne, ali u ovom slučaju možemo ispuniti te vrijednosti jer znamo identifikatore svakog pacijenta.
+
+```{r}
+subset(metadata, patient == "L736")
+```
+
+Funkcija `fill()` Ispunjuje nedostajuće vrijednosti u onim varijablama koje navedemo, tražeći vrijednosti s kojima ih treba ispuniti u smjeru koji definiramo u paramteru `.direction`.
+
+Ovdje smo najprije grupirali sve uzorke/redove po ID-u pacijenta (npr. L736N i L736T imaju isti ID pacijenta i bit će grupirani zajedno). Zatim `fill` zamijeni `NA` vrijednosti u uzorku iz zdravog tkiva s onima koji postoje u tumorskom (za varijable: `age, dead, gender, histology, ps_who, smoking, stage_tnm`).
+
+```{r}
+metadata <- metadata %>%
+  ## grupiraj redove po šifri pacijenta
+  group_by(patient) %>%
+  ## ispuni nedostajuće vrijednosti za svaki par
+  tidyr::fill(age, dead, gender, ps_who, smoking, .direction = "downup") %>%
+  ungroup()
+
+## provjera na jednom pacijentu
+subset(metadata, patient == "L736")
+```
+
+Neke vrijednosti varijable *dead* nedostaju, ali nisu zabilježne kao `NA`, već kao tekstualni tip "n/a".
+
+```{r}
+## koliko pacijenata je u svakoj kategoriji
+table(metadata$dead, useNA = "ifany")
+
+metadata <- metadata %>% 
+  dplyr::mutate(dead = na_if(dead, "n/a"))
+```
+
+Završna provjera:
+
+```{r}
+summary(subset(metadata, condition == "T"))
+table(metadata$condition)
+```
+
+### Učitavanje read count tablice
+
+Također je moguće učitati i dodatne podatke koje su autori učinili dostupnim u sklopu projekta - u ovom slučaju moguće je učitati odmah i tablicu s brojem readova za svaki gen i sve uzorke.
+
+```{r}
+# dodatni dostipni podaci
+geo_supplemental_files  <- getGEOSuppFiles(my_geo)
+counts <- read.table(rownames(geo_supplemental_files)[2], header = TRUE, sep = "\t")
+
+rownames(counts) <- counts$Ensembl_gene_id
+counts$Ensembl_gene_id <- NULL
+counts[1:5, 1:5]
+```
+
+Provjera koliko uzoraka i gena imamo:
+
+```{r}
+## uklanjanje redaka s nedostajućim vrijednostima
+counts <- counts[complete.cases(counts), ]
+dim(counts)
+```
+
+Budući da naši metapodaci sadrže informacije o svim uzorcima, a nas trenutno zanimaju samo oni s uparenim uzorcima, najprije ćemo izdvojiti pacijente s uparenim uzorcima:
+
+```{r}
+normal_samples <- subset(metadata, condition == "N")$patient
+paired_samples <- subset(metadata, patient %in% normal_samples)
+paired_samples
+```
+
+Također trebamo odabrati samo te uzorke iz tablice s brojem readova:
+
+```{r}
+counts_ps <- counts[, paired_samples$sample]
+dim(counts_ps)
+```
+
+Jako je bitno da nam se nazivi stupaca od tablice s brojem *readova* (nazivi uzoraka) podudaraju s nazivima redova u našim metapodacima. To znači da su uzorci u obje tablice poredanim istim redoslijedom - bitno da pripišemo ispravne metapodatke svakom pacijentu.
+
+```{r}
+rownames(paired_samples) <- paired_samples$sample
+all(rownames(paired_samples) == colnames(counts_ps))
+```
+
+### Vizualne provjere naših uzoraka:
+
+Izračun veličine biblioteke svakog uzorka:
+
+```{r}
+lib_sizes <- colSums(counts_ps)
+
+sample_lib_size <- data.frame(
+  sample = names(lib_sizes),
+  library_size = lib_sizes
+)
+```
+
+Vizualizacija veličine biblioteke:
+
+```{r}
+ggplot(sample_lib_size, aes(x = sample, y = library_size, fill = sample)) +
+  geom_col() +
+  labs(
+    x = "Sample",
+    y = "Library size (total counts)",
+    title = "Library sizes per sample"
+  ) +
+  theme_bw() +
+  theme(legend.position = "none") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+## DESeq2 analiza
+
+R paket DESeq2 služi za analizu diferencijalno eksprimiranih gena. Analiza se provodi u 3 ključna koraka:
+
+1.  **normalizacija** - prilagođava sirove podatke tako da različita dubina sekvenciranja u uzorcima ne stvara prividne razlike u eksprimiranosti gena
+
+2.  **procjena šuma** - procijeni kolika su prirodna odstupanja i biološki šum specifičan za svaki gen te određuje koje gene treba "tretirati strože" kako bi se spriječili lažno pozitivni rezultati
+
+3.  **Waldov test** - statistička provjera jesu li preostale razlike između grupa dovoljno velike da ih se smatra značajnima
+
+Kao rezultat dobivamo listu gena s informacijom koliko su drugačiji u odnosu na referentnu grupu te koliko je ta razlika pouzdana.
+
+------------------------------------------------------------------------
+
+Kreiranje DESeq2 objekta iz tablice s brojem *readova* i metapodataka:
+
+Želimo stvoriti DESeq2 objekt koji spaja tablicu s brojem *readova* i metapodatke o uzorcima u jedinstvenu strukturu, te definira dizajn analize. Želimo testirati razliku između zdravih i tumorskih uzoraka (`condition`), ali tek nakon što kontroliramo varijabilnost koja dolazi od samog pacijenta (`patient`), odnosno pronaći razliku između tumora i zdravih tkiva, a ne između pacijenata.
+
+Kod definiranja dizajna eksperimenta (`design`), vrlo je važno zapamtiti da grupa na temelju koje želimo pronaći razlike (u ovom slučaju `condition`) **mora biti navedena posljednja**. Sve ostale grupe koje navedemo prije su razlike koje želimo uzeti u obzir i za koje želimo korigirati prilikom analize diferencijalne ekspresije gena.
+
+```{r}
+deseq_dataset <- DESeqDataSetFromMatrix(
+  countData = counts_ps,
+  colData = paired_samples,
+  design = ~ patient + condition
+)
+```
+
+Filtriranje gena prema minimalnom broju očitanja kako bi uklonili gene s vrlo slabom ekspresijom i ostavili samo one koji imaju dovoljno podataka da DESeq2 može pouzdano procijeniti razlike u ekspresiji.
+
+Zadržat ćemo samo one gene koji imaju ukupno 10 ili više readova u svim uzorcima.
+
+```{r}
+genes_to_keep <- rowSums(counts(deseq_dataset)) >= 10
+table(genes_to_keep)
+
+deseq_dataset_subset <- deseq_dataset[genes_to_keep, ]
+```
+
+Za početak želimo provjeriti kako se grupiraju naši uzorci s obzirom na razne varijable. Idealno će se razdvajati na temelju grupe od glavnog interesa, a neće na temelju onih koje bi mogle ukazivati na *batch effect*.
+
+Transformacije smanjuju utjecaj šuma kod nisko izraženih gena i izjednačavaju varijabilnost. Time vizualizacije poput PCA i heatmap-a postaju jasnije, a razlike među uzorcima prikazuju stvarne biološke razlike.
+
+Transformacija broja *readova* za za PCA plot.
+
+```{r}
+vsd <- vst(deseq_dataset_subset, blind = TRUE)
+```
+
+Argument `blind` određuje hoće li transformacija ignorirati dizajn eksperimenta ili ne. Vrijednost `FALSE` znači da je dizajn uzet u obzir prilikom procjene varijance -\> ne želimo brisati stvarnu biološku varijancu između zdravih i tumorskih stanica.
+
+Izrada **PCA plota** na temelju varijance-stabiliziranih podataka
+
+```{r}
+interesting_variables <- c("condition", "histology", "dead", "age", "gender", "ps_who", "smoking", "stage_tnm")
+pcaData <- plotPCA(vsd, intgroup = interesting_variables, returnData = TRUE)
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+
+lapply(interesting_variables, function(var) {
+  ggplot(pcaData, aes(PC1, PC2, color = get(var))) +
+    geom_point(size = 3) +
+    xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+    ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+    labs(
+      color = var
+    ) +
+    theme_bw()
+})
+```
+
+Pokretanje diferencijalne analize ekspresije:
+
+Jedna funkcija pokreće analizu i odrađuje sve potrebne korake u pozadini (normalizacija, modeliranje, testiranje).
+
+```{r}
+deseq <- DESeq(deseq_dataset_subset)
+
+res <- results(deseq, alpha = 0.05)
+```
+
+Analiza rezultata:
+
+```{r}
+head(res)
+summary(res)
+```
+
+Filtriranje statistički značajnih gena prema p-vrijednosti i log2FC-u:
+
+```{r}
+res_sig <- subset(res, padj < 0.05 & abs(log2FoldChange) > 1)
+nrow(res_sig)
+head(res_sig)
+```
+
+Koje uvjete mora gen zadovoljiti da bi ga smatrali značajnim? Prema ovim kriterijima - mora imati korigiranu p-vrijednost manju od 0.05 i apsolutnu vrijednost *log2 fold change*-a veću od 1. **Korigirana p-vrijednost** **mora** **biti manja od 0.05**, dok *log2 fold change* se može prilagođavati ovisno o tome što je predmet istraživanja i broju gena za koje je razlika značajna.
+
+Rezultate možemo spremiti u .csv formatu za daljnje analize.
+
+```{r}
+write.csv(res_sig, "significant_genes.csv", row.names = TRUE)
+```
+
+## Vizualizacija rezultata
+
+Transformacija broja *readova* za **heatmap**:
+
+```{r}
+ntd <- normTransform(deseq_dataset_subset)
+```
+
+Priprema anotacije uzoraka za heatmapu:
+
+```{r}
+ann <- as.data.frame(colData(deseq_dataset_subset)[, c("condition", "gender", "dead", "histology", "smoking", "stage_tnm")])
+rownames(ann) <- rownames(colData(deseq_dataset_subset))
+```
+
+Odabir diferencijalno eksprimiranih gena za prikaz na heatmap-u:
+
+```{r}
+select <- rownames(subset(res, padj < 0.05 & abs(log2FoldChange) > 2))
+length(select)
+
+pheatmap(
+  mat = assay(ntd)[select, ], 
+  cluster_rows = TRUE, 
+  show_rownames = FALSE,
+  cluster_cols = TRUE, 
+  annotation_col = ann#,
+  #filename = "pheatmap.pdf"
+  )
+```
+
+Kako mijenjanje granične vrijednosti za `abs(log2FoldChange)` utječe na heatmap?
+
+Prikaz **MA plota** diferencijalne ekspresije:
+
+```{r}
+plotMA(res, ylim = c(-5, 5))
+```
+
+Što sve gledamo na MA plotu?
+
+-   plave točke predstavljaju značajno diferencijalno izražene gene - ima ih mnogo kroz cijeli raspon ekspresije -\> snažna razlika između zdravih i tumorskih stanica
+
+-   širina plavog oblaka:
+
+    -   nisko eksprimirani geni (lijevo) su varijabilniji i skloniji šumu
+
+    -   visoko eksprimirani geni (desno) su manje šumoviti
+
+-   simetričan raspored oko osi -\> nema očite tehničke pristranosti -\> dobra normalizacija
+
+Priprema podataka za **volcano plot**:
+
+Trenutno naša tablica s genima sadrži Ensembl indentifikatore za nazive gene, dok je uobičajenije prikazati simbole gena na određenim grafovima. Postoje razne funkcije koje automatski prevode identifikatore iz jednog formata u drugi.
+
+```{r}
+padj_cut <- 0.05
+lfc_cut <- 1
+
+## prevođenje Ensembl identifikatora u simbole gena
+res$symbol <- mapIds(org.Hs.eg.db,
+                     keys = row.names(res),
+                     column = "SYMBOL",
+                     keytype = "ENSEMBL",
+                     multiVals = "first")
+
+## koristiti originalni Ensembl ID ukoliko nije pronađen simbol za neki gen
+res$symbol <- ifelse(is.na(res$symbol), row.names(res), res$symbol)
+
+## volcano plot
+EnhancedVolcano(res,
+                lab = res$symbol,
+                x = 'log2FoldChange',
+                y = 'pvalue',
+                pCutoff = padj_cut,
+                FCcutoff = lfc_cut,
+                title = "Volcano plot - Tumour vs normal",
+                subtitle = NULL,
+                caption = NULL)
+
+ggsave("volcano_plot.png", dpi = 300, units = "in", width = 10, height = 8)
+```
+
+# Gene enrichment analiza
+
+Otkriva koje su biološke funkcije, procesi ili putovi zastupljeni među genima. Želimo povezati rezultate koje smo dobili DESeq2 analizom s biološkim funkcijama.
+
+### *Gene enrichement* s bazom *Gene Ontology*
+
+Priprema podataka za analizu obogaćenja gena:
+
+Napravit ćemo nove varijable koje će opisivati naše gene:
+
+-   `regulation`: označit ćemo imaju li geni povećanu ili smanjenu ekspresiju
+
+-   `significant`: označit ćemo je li gen statistički značajan i ima li dovoljno veliku promjenu
+
+```{r}
+padj_threshold <- 0.05
+log2FoldChange_threshold <- 2
+
+res <- as.data.frame(res)
+res$regulation <- "Not significant"
+res$regulation[res$padj < padj_threshold & res$log2FoldChange > log2FoldChange_threshold] <- "Upregulated"
+res$regulation[res$padj < padj_threshold & res$log2FoldChange < -(log2FoldChange_threshold)] <- "Downregulated"
+
+res$significant <- ifelse(res$padj < padj_threshold & abs(res$log2FoldChange) > log2FoldChange_threshold,
+                             "Significant", "Not significant")
+
+table(res$regulation)
+```
+
+Odabrat ćemo 500 najznačajnijih gena s najmanjim korigiranim p-vrijednostima i koristiti samo njih kako bi sama vizualizacija bila malo brža.
+
+Korsitit ćemo funkciju `bitr()` kako bi preveli genske simbole u ENTREZ ID (brojčani ID) te ih spojili s tablicom rezultata koju smo prethodno dobili.
+
+Grupirat ćemo gene prema njihovoj regulaciji te analizirati koji biološki procesi su u njima obogaćeni.
+
+```{r}
+res_top <- res[order(res$padj), ][1:500,]
+table(res_top$regulation)
+
+res_top <- full_join(res_top,
+                     bitr(res_top$symbol, fromType = "SYMBOL", toType = c("SYMBOL", "ENTREZID"), OrgDb = org.Hs.eg.db),
+                     by = c("symbol" = "SYMBOL"))
+
+enrich_go <- compareCluster(
+   ENTREZID ~ regulation, data = res_top[res_top$significant != "Not significant", ], 
+   fun = "enrichGO",
+   OrgDb = org.Hs.eg.db,
+   pAdjustMethod = "BH",
+   pvalueCutoff = 0.05, qvalueCutoff = 0.05, readable = T
+   )
+
+```
+
+Graf koji prikazuje 10 najznačajnijih procesa u našim genima za svaku grupu:
+
+```{r}
+dotplot(enrich_go, showCategory = 10)
+ggsave("go_dotplot.png", width = 8, height = 8, dpi = 300)
+```
+
+Kako interpretirati graf: p.adjust (boja točkice) označava statističku značajnost korigiranu za višestruko testiranje; što je točkica crvenija, manja je šansa da je rezultat slučajan. GeneRatio (veličina točkice) predstavlja udio značajnih gena koji pripadaju tom specifičnom putu u odnosu na ukupan broj mapiranih gena.
+
+Graf koji povezuje biološke procese s genima koji ih čine - prikazat ćemo 3 najznačajnija procesa za svaku grupu prema regulaciji gena:
+
+```{r}
+cnetplot(enrich_go, showCategory = 3) 
+ggsave("go_concept_network_plot.png", width = 8, height = 8, dpi = 300)
+```
+
+### *Gene enrichement* s bazom *KEGG*
+
+*KEGG* je zbirka bioloških putova koji prikazuju kako geni, proteini i metabolički procesi međusobno surađuju u organizmu.
+
+Na istom setu od 500 najznačajnijih gena ćemo također napraviti sličnu analizu, ali ovaj put koristeći biološke putove iz KEGG baze.
+
+```{r}
+kegg_comparison <- compareCluster(ENTREZID ~ regulation, 
+                                  data = res_top[res_top$significant != "Not significant", ], 
+                                  fun = "enrichKEGG",
+                                  organism = "hsa", 
+                                  pAdjustMethod = "BH",
+                                  pvalueCutoff = 0.05, 
+                                  qvalueCutoff = 0.05)
+
+## pretvaranje ENTREZ identifikatora u simbole gena
+kegg_comparison <- setReadable(kegg_comparison, OrgDb = org.Hs.eg.db, keyType = "ENTREZID")
+```
+
+Graf koji prikazuje 10 najznačajnijih putova u našim genima za svaku grupu:
+
+```{r}
+dotplot(kegg_comparison, showCategory = 10, title = "KEGG Pathway Comparison")
+ggsave("kegg_dotplot.png", width = 8, height = 8, dpi = 300)
+```
+
+Graf koji povezuje biološke putoves genima koji ih čine:
+
+```{r}
+cnetplot(kegg_comparison, showCategory = 3)
+ggsave("kegg_concept_network_plot.png", width = 8, height = 8, dpi = 300)
+```
